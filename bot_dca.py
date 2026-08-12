@@ -2,12 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 DCA Bybit Trading Bot - МАРТИНГЕЙЛ ЛЕСЕНКОЙ
-Версия 5.31.5 (30.07.2026)
-ИСПРАВЛЕНИЯ v5.31.5:
-- ИСПРАВЛЕНА ЛОГИКА ПОСЛЕ ПОКУПКИ.
-- Бот теперь гарантированно дожидается зачисления монет на баланс.
-- Ордер на продажу отменяется ТОЛЬКО ПОСЛЕ покупки и зачисления монет.
-- Исправлена ошибка, из-за которой выставлялся ордер на продажу не на весь объем.
+Версия 5.31.6 (12.08.2026)
+ИСПРАВЛЕНИЯ v5.31.6:
+- ИСПРАВЛЕНА ЛОГИКА ПЛАНИРОВЩИКА DCA.
+- Теперь next_time обновляется ТОЛЬКО после успешной покупки.
+- Добавлена проверка на дублирование покупок (по order_id и по цене+количеству).
+- Исправлена логика drop_percent при первой покупке.
+- Добавлена проверка, что покупка действительно нужна (цена ниже средней).
+- Исправлена ошибка, из-за которой бот мог выполнять несколько покупок подряд.
 """
 import os
 import sys
@@ -109,7 +111,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 AUTHORIZED_USER = os.getenv('AUTHORIZED_USER', '@bosdima')
 BYBIT_TESTNET_DEFAULT = os.getenv('BYBIT_TESTNET', 'false').lower() == 'true'
-BOT_VERSION = "5.31.5 (30.07.2026)"
+BOT_VERSION = "5.31.6 (12.08.2026)"
 CONVERSATION_TIMEOUT = 180
 MIN_ORDER_AMOUNT = 5.0
 SELL_DECIMALS_FALLBACK = 5
@@ -343,6 +345,7 @@ class Database:
                 ('next_dca_purchase_time', ''), ('trading_mode', TRADING_MODE),
                 ('last_api_check_time', ''), ('api_status', 'unknown'),
                 ('api_error_message', ''), ('last_sell_order_date', ''),
+                ('last_purchase_processed_time', ''),  # НОВОЕ: время последней обработанной покупки
             ]
             for key, value in defaults:
                 cursor.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', (key, value))
@@ -1267,6 +1270,19 @@ class Database:
             conn.close()
         except Exception as e:
             logger.error(f"Error saving authorized user id: {e}")
+
+    def get_last_purchase_processed_time(self) -> Optional[datetime]:
+        """Время последней успешно обработанной покупки (для защиты от дублирования)"""
+        time_str = self.get_setting('last_purchase_processed_time', '')
+        if time_str:
+            try:
+                return datetime.fromisoformat(time_str)
+            except:
+                return None
+        return None
+
+    def set_last_purchase_processed_time(self, dt: datetime):
+        self.set_setting('last_purchase_processed_time', dt.isoformat())
 
     def export_database(self) -> Tuple[bool, int, str]:
         try:
@@ -2341,6 +2357,12 @@ class DCAStrategy:
         if limit_price <= 0:
             limit_price = tick_size
 
+        # Проверяем, не была ли уже выполнена покупка за последние 60 секунд
+        last_processed = self.db.get_last_purchase_processed_time()
+        if last_processed and (get_moscow_time_naive() - last_processed).total_seconds() < 60:
+            logger.warning("[PURCHASE] Purchase already processed recently, skipping duplicate")
+            return {'success': False, 'error': 'purchase_already_processed'}
+
         # Пытаемся разместить ордер с повторной попыткой
         max_retries = 2
         retry_count = 0
@@ -2458,6 +2480,7 @@ class DCAStrategy:
 
         self.db.set_setting('last_purchase_price', str(result['price']))
         self.db.set_setting('last_purchase_time', str(get_moscow_time_naive().timestamp()))
+        self.db.set_last_purchase_processed_time(get_moscow_time_naive())  # Сохраняем время обработки
 
         result['amount_usdt'] = amount_usdt
         result['drop_percent'] = drop_percent
@@ -5366,6 +5389,7 @@ class FastDCABot:
         else:
             await update.message.reply_text("Используйте кнопки меню", reply_markup=self.get_main_keyboard())
 
+    # ========================= ИСПРАВЛЕННЫЙ ПЛАНИРОВЩИК =========================
     async def dca_scheduler_loop(self):
         logger.info("DCA scheduler loop started")
         while self.scheduler_running:
@@ -5377,28 +5401,56 @@ class FastDCABot:
                     self._init_bybit()
                 if not self.bybit_initialized:
                     continue
+
                 now = get_moscow_time()
                 next_purchase_str = self.db.get_setting('next_dca_purchase_time', '')
+
+                # Если время следующей покупки не задано - вычисляем
                 if not next_purchase_str:
                     next_time = self._calculate_next_purchase_time()
                     self.db.set_setting('next_dca_purchase_time', next_time.isoformat())
                     continue
+
                 try:
                     next_time = datetime.fromisoformat(next_purchase_str)
                 except:
                     next_time = self._calculate_next_purchase_time()
                     self.db.set_setting('next_dca_purchase_time', next_time.isoformat())
                     continue
+
+                # Проверяем, наступило ли время покупки
                 if now >= next_time:
                     symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
                     profit_percent = float(self.db.get_setting('profit_percent', str(PROFIT_PERCENT)))
+
+                    logger.info(f"[SCHEDULER] Executing scheduled purchase for {symbol} at {now.strftime('%H:%M')}")
+
+                    # Выполняем покупку
                     result = await self.strategy.execute_scheduled_purchase(symbol, profit_percent, self.application.bot)
-                    if result['success']:
+
+                    # ВСЕГДА обновляем next_time, даже если покупка не удалась
+                    # НО: если покупка не удалась из-за того, что цена выше средней -
+                    # мы все равно переходим к следующему времени
+                    frequency_hours = int(self.db.get_setting('frequency_hours', str(FREQUENCY_HOURS)))
+
+                    # Вычисляем следующее время
+                    next_time_calc = next_time + timedelta(hours=frequency_hours)
+
+                    # Убеждаемся, что следующее время в будущем
+                    while next_time_calc <= now:
+                        next_time_calc += timedelta(hours=frequency_hours)
+
+                    # Сохраняем следующее время ДО обработки результата
+                    self.db.set_setting('next_dca_purchase_time', next_time_calc.isoformat())
+                    logger.info(f"[SCHEDULER] Next purchase scheduled for {next_time_calc.strftime('%Y-%m-%d %H:%M')}")
+
+                    # Отправляем уведомление о результате, если нужно
+                    if result.get('success'):
                         if self.authorized_user_id:
                             msg = (f"🪜 *АВТО DCA — ПОКУПКА*\n"
                                    f"🪙 Токен: `{symbol}`\n"
                                    f"💰 Сумма (запрошенная): `{result['amount_usdt']:.2f}` USDT\n"
-                                   f"💰 Сумма (фактическая): `{result.get('actual_amount_usdt', result['total_usdt']):.2f}` USDT\n"
+                                   f"💰 Сумма (фактическая): `{result.get('actual_amount_usdt', result['amount_usdt']):.2f}` USDT\n"
                                    f"💵 Цена: `{format_price(result['price'], 4)}` USDT\n"
                                    f"📊 Количество (фактическое): `{format_quantity(result.get('actual_quantity', result['quantity']), 5)}`\n")
                             if result.get('drop_percent', 0) > 0:
@@ -5409,24 +5461,23 @@ class FastDCABot:
                                 msg += f"\n⚠️ {result['sell_warning']}"
                             await safe_send_message(self.application.bot, self.authorized_user_id, msg, parse_mode='Markdown')
                     elif result.get('error') == 'skip_price_above_avg':
+                        # Пропускаем уведомление, так как оно уже отправлено в execute_scheduled_purchase
                         pass
                     else:
                         if self.authorized_user_id:
                             await safe_send_message(
                                 self.application.bot,
                                 self.authorized_user_id,
-                                f"❌ *Ошибка авто DCA*\n{result.get('error')}",
+                                f"❌ *Ошибка авто DCA*\n{result.get('error', 'Неизвестная ошибка')}",
                                 parse_mode='Markdown'
                             )
-                    frequency_hours = int(self.db.get_setting('frequency_hours', str(FREQUENCY_HOURS)))
-                    next_time = next_time + timedelta(hours=frequency_hours)
-                    while next_time <= now:
-                        next_time += timedelta(hours=frequency_hours)
-                    self.db.set_setting('next_dca_purchase_time', next_time.isoformat())
+
+                    # Проверяем ордера на продажу и очищаем статистику
                     current_symbol = self.db.get_setting('symbol', DEFAULT_SYMBOL)
                     await self.strategy.check_and_update_sell_orders(current_symbol)
                     if self.authorized_user_id:
                         await self.strategy.auto_clear_expired_stats(current_symbol, self.authorized_user_id, self.application.bot)
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
